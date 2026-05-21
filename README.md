@@ -65,6 +65,49 @@ VE-sharing additions:
 
 Practical Jellyfin policy: **1× realtime 4K transcode max**, or **2× ≤720p concurrent near-realtime**.
 
+## Kernel modules
+
+### Required modules
+
+| Module | File | Provides | Load order |
+|---|---|---|---|
+| `sunxi-cedrus` | `sunxi-cedrus.ko` | `/dev/video1`, `/dev/media1` (cedrus decoder) | 1st |
+| `sunxi-venc` | `sunxi-venc.ko` | `/dev/video2` (H264 encoder) | 2nd (depends on cedrus) |
+
+`sunxi-venc` declares a hard dependency on `sunxi-cedrus`, so `modprobe sunxi-venc` loads both. Loading cedrus first is still recommended for clarity.
+
+Auto-loaded dependencies:
+
+```
+v4l2-mem2mem  videobuf2-v4l2  videobuf2-common
+videobuf2-dma-contig  videobuf2-dma-sg
+```
+
+### Load manually
+
+```sh
+sudo modprobe sunxi-cedrus
+sudo modprobe sunxi-venc
+# Verify
+ls /dev/video1 /dev/video2 /dev/media1
+dmesg | grep -E "cedrus|sunxi-venc" | tail -10
+```
+
+### Load automatically at boot
+
+```sh
+echo -e "sunxi-cedrus\nsunxi-venc" | sudo tee -a /etc/modules-load.d/modules.conf
+```
+
+> **Note:** `sunxi-venc` must come after `sunxi-cedrus` in the file — modules-load.d applies entries in order.
+
+### Optional: override VE clock at load time
+
+```sh
+sudo modprobe sunxi-cedrus clk_hz=720000000   # 720 MHz (conservative)
+# Default is 792 MHz — validated ceiling for clean encode output
+```
+
 ## Installation with orangepi-build
 
 ### Step 1 — Apply the DTS patches (required)
