@@ -1,0 +1,24 @@
+--- a/arch/arm64/boot/dts/allwinner/sun55i-t527-orangepi-4a.dts
++++ b/arch/arm64/boot/dts/allwinner/sun55i-t527-orangepi-4a.dts
+@@ -2925,9 +2925,21 @@
+ };
+ 
+ &ve {
++	reg = <0x0 0x01c0e000 0x0 0x1000>;
++	clock-names = "ahb", "mod", "ram";
++	/delete-property/ reset-names;
++	/* Master 2 = VE_MBUS0 handles output DMA writes.
++	 * Master 3 = VE_MBUS1 handles MC reference reads and is enabled
++	 * explicitly in cedrus_hw_probe via sunxi_enable_device_iommu(3). */
++	iommus = <&mmu_aw 2 1>;
+ 	ve-supply = <&reg_dcdc2>;
+ };
+ 
++/* Disable duplicate ve1 node to avoid probe failure */
++&ve1 {
++	status = "disabled";
++};
++
+ /* audio dirver module -> audio codec */
+ &codec {
+ 	//tx-hub-en;
