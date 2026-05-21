@@ -1,0 +1,15 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -89,10 +89,8 @@
+ 
+ 	dev->dec_ops[ctx->current_codec]->setup(ctx, &run);
+ 
+-	/* Complete request(s) controls if needed. */
+-
+-	if (src_req)
+-		v4l2_ctrl_request_complete(src_req, &ctx->hdl);
++	/* Defer request completion to IRQ handler (after HW finishes) */
++	ctx->current_req = src_req;
+ 
+ 	dev->dec_ops[ctx->current_codec]->trigger(ctx);
+ }

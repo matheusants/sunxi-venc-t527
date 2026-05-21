@@ -1,0 +1,19 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -16,6 +16,7 @@
+ #include <linux/pm_runtime.h>
+ 
+ #include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-dma-sg.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-ioctl.h>
+ #include <media/v4l2-event.h>
+@@ -589,7 +590,7 @@
+ 	dst_vq->buf_struct_size = sizeof(struct cedrus_buffer);
+ 	dst_vq->min_buffers_needed = 1;
+ 	dst_vq->ops = &cedrus_qops;
+-	dst_vq->mem_ops = &vb2_dma_contig_memops;
++	dst_vq->mem_ops = &vb2_dma_sg_memops;
+ 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+ 	dst_vq->lock = &ctx->dev->dev_mutex;
+ 	dst_vq->dev = ctx->dev->dev;

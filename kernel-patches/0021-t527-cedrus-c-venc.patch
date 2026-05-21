@@ -1,0 +1,38 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -17,6 +17,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/pm.h>
++#include <linux/semaphore.h>
+ 
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-ioctl.h>
+@@ -28,6 +29,8 @@
+ #include "cedrus_dec.h"
+ #include "cedrus_hw.h"
+ 
++extern struct semaphore sunxi_ve_sem;
++
+ static const struct cedrus_control cedrus_controls[] = {
+ 	{
+ 		.cfg = {
+@@ -316,6 +319,18 @@
+ 
+ 	mutex_lock(&dev->dev_mutex);
+ 
++	/*
++	 * Block until any in-flight HW transaction on this device completes.
++	 * A running decode holds sunxi_ve_sem from cedrus_device_run() until
++	 * cedrus_irq() does up() after v4l2_m2m_buf_done_and_job_finish().
++	 * When we return from down(), no cedrus_irq() can be mid-flight
++	 * against the ctx we are about to free — preventing the use-after-
++	 * free race where the IRQ fires after v4l2_m2m_ctx_release() has
++	 * torn down m2m_ctx state.
++	 */
++	down(&sunxi_ve_sem);
++	up(&sunxi_ve_sem);
++
+ 	v4l2_fh_del(&ctx->fh);
+ 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+ 

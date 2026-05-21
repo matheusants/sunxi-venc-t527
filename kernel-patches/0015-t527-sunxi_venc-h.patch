@@ -1,0 +1,166 @@
+--- /dev/null
++++ b/drivers/staging/media/sunxi/sunxi-venc/sunxi_venc.h
+@@ -0,0 +1,163 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Allwinner sunxi H264 hardware encoder driver.
++ *
++ * Stateful V4L2 memory-to-memory encoder: raw NV12 frames in the OUTPUT
++ * queue, coded H264 bitstream out the CAPTURE queue. Targets the AVC encode
++ * engine of the Allwinner T527 Video Engine.
++ *
++ * Path B of the T527 hardware-video project. See the project plan and
++ * path-a-cedar-bsp-enc/VE_REG_TRACE.md for the hardware register details.
++ */
++
++#ifndef _SUNXI_VENC_H_
++#define _SUNXI_VENC_H_
++
++#include <linux/platform_device.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-v4l2.h>
++#include <media/videobuf2-dma-contig.h>
++
++#define SUNXI_VENC_NAME		"sunxi-venc"
++
++#define SUNXI_VENC_MIN_WIDTH	16U
++#define SUNXI_VENC_MIN_HEIGHT	16U
++#define SUNXI_VENC_MAX_WIDTH	3840U
++#define SUNXI_VENC_MAX_HEIGHT	2160U
++
++/* Queue direction a format is valid for. */
++#define SUNXI_VENC_FMT_OUTPUT	BIT(0)	/* raw input  */
++#define SUNXI_VENC_FMT_CAPTURE	BIT(1)	/* coded output */
++
++struct sunxi_venc_fmt {
++	u32	pixelformat;
++	u32	directions;
++};
++
++struct sunxi_venc_dev {
++	struct v4l2_device	v4l2_dev;
++	struct video_device	vfd;
++	struct media_device	mdev;
++	struct platform_device	*pdev;
++	struct device		*dev;
++	struct v4l2_m2m_dev	*m2m_dev;
++
++	/* Device file mutex */
++	struct mutex		dev_mutex;
++
++	void __iomem		*base;
++
++	struct clk		*mod_clk;
++	struct clk		*ahb_clk;
++	struct clk		*ram_clk;
++	struct reset_control	*rstc;
++
++	int			irq;
++};
++
++/*
++ * Per-encode scratch buffer the VE writes during a frame. dma_alloc_coherent
++ * memory; the dma_addr_t is the IOMMU IOVA programmed into the VE address
++ * registers (AVC block: iova >> 8; ISP block: full iova).
++ */
++struct sunxi_venc_buf {
++	void		*cpu;
++	dma_addr_t	dma;
++	size_t		size;
++};
++
++/*
++ * Encode parameters, fed by the V4L2 control handler (sunxi_venc_ctrls.c).
++ * H264 profile/level/entropy affect the SPS/PPS and only take effect at the
++ * start of a stream; bitrate / QP / GOP are consumed per frame.
++ */
++struct sunxi_venc_params {
++	unsigned int	gop_size;	/* frames between IDRs */
++	unsigned int	bitrate;	/* target bitrate, bits/s (0 = fixed QP) */
++	unsigned int	framerate;	/* fps, for rate-control budgeting */
++	bool		cbr;		/* true = CBR, false = VBR */
++	unsigned int	qp_i, qp_p;	/* fixed / seed QP for I and P frames */
++	unsigned int	qp_min, qp_max;	/* rate-control QP bounds */
++	unsigned int	profile_idc;	/* H264 profile_idc (66/77/100) */
++	unsigned int	constraints;	/* SPS constraint_set flags byte */
++	unsigned int	level_idc;	/* H264 level_idc */
++	bool		cabac;		/* entropy: true = CABAC, false = CAVLC */
++};
++
++struct sunxi_venc_ctx {
++	struct v4l2_fh			fh;
++	struct sunxi_venc_dev		*dev;
++
++	struct v4l2_pix_format		src_fmt;	/* raw NV12  (OUTPUT)  */
++	struct v4l2_pix_format		dst_fmt;	/* coded H264 (CAPTURE) */
++
++	struct v4l2_ctrl_handler	hdl;
++	struct sunxi_venc_params	params;
++	bool				force_keyframe;	/* set by FORCE_KEY_FRAME ctrl */
++
++	/* running frame counter — drives IDR/P selection. */
++	unsigned int			frame_num;
++
++	/* Driver-side rate-control state. */
++	unsigned int			rc_qp;	/* current QP picked per frame */
++	int				rc_buf;	/* leaky-bucket bit accumulator */
++
++	/* Geometry, derived from src_fmt at start_streaming. */
++	unsigned int			mb_width, mb_height, mb_stride;
++	unsigned int			crop_right, crop_bottom;
++
++	/* Visible rectangle inside the 16-aligned coded frame; defaults to the
++	 * full coded frame, narrowed by VIDIOC_S_SELECTION (V4L2_SEL_TGT_CROP).
++	 * Drives the SPS frame_cropping syntax. */
++	struct v4l2_rect		crop;
++
++	/* SPS/PPS emitted once at the head of the coded stream. */
++	bool				write_headers;
++
++	/* Reconstruction / reference picture buffers (ping-pong, M2 uses [1]). */
++	struct sunxi_venc_buf		rec_luma[2];	/* luma + chroma packed */
++	struct sunxi_venc_buf		rec_sluma[2];	/* sub-sampled luma scratch */
++	struct sunxi_venc_buf		mb_info;	/* per-MB info scratch */
++	struct sunxi_venc_buf		enc_extra;	/* frame-level scratch */
++	struct sunxi_venc_buf		enc_scratch;	/* VE_AVC_SCRATCH_BUF (0xb9c) */
++	struct sunxi_venc_buf		line_buf;	/* VE wide-frame line buffer (0xbc4) */
++	unsigned int			rec_chroma_off;	/* chroma offset in rec_luma */
++	bool				buffers_ready;
++};
++
++static inline void venc_write(struct sunxi_venc_dev *dev, u32 reg, u32 val)
++{
++	writel(val, dev->base + reg);
++}
++
++static inline u32 venc_read(struct sunxi_venc_dev *dev, u32 reg)
++{
++	return readl(dev->base + reg);
++}
++
++/* sunxi_venc_video.c */
++extern const struct v4l2_ioctl_ops sunxi_venc_ioctl_ops;
++int sunxi_venc_queue_init(void *priv, struct vb2_queue *src_vq,
++			  struct vb2_queue *dst_vq);
++void sunxi_venc_prepare_format(struct v4l2_pix_format *pix_fmt);
++
++/* sunxi_venc.c — hardware bring-up */
++int sunxi_venc_hw_probe(struct sunxi_venc_dev *dev);
++void sunxi_venc_hw_remove(struct sunxi_venc_dev *dev);
++int sunxi_venc_hw_suspend(struct device *device);
++int sunxi_venc_hw_resume(struct device *device);
++
++/* sunxi_venc_h264.c — encoder core */
++int sunxi_venc_h264_start(struct sunxi_venc_ctx *ctx);
++void sunxi_venc_h264_stop(struct sunxi_venc_ctx *ctx);
++int sunxi_venc_h264_encode(struct sunxi_venc_ctx *ctx,
++			   struct vb2_buffer *src, struct vb2_buffer *dst);
++bool sunxi_venc_h264_frame_is_idr(struct sunxi_venc_ctx *ctx);
++
++/* sunxi_venc_ctrls.c — V4L2 control handler */
++int sunxi_venc_ctrls_setup(struct sunxi_venc_ctx *ctx);
++
++#endif /* _SUNXI_VENC_H_ */

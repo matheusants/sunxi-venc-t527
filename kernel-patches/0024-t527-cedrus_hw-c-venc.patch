@@ -1,0 +1,258 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -32,6 +32,150 @@
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
+ 
++#include <linux/semaphore.h>
++
++/*
++ * The T527 VE is a single hardware engine shared by the cedrus decoder and
++ * the sunxi-venc encoder. This counting semaphore serialises VE ownership:
++ * a decode and an encode must never program the engine concurrently. It is
++ * held by cedrus from device_run() until the completion IRQ, and by
++ * sunxi-venc for the duration of one (synchronous, poll-mode) encode.
++ */
++DEFINE_SEMAPHORE(sunxi_ve_sem);
++EXPORT_SYMBOL_GPL(sunxi_ve_sem);
++
++/*
++ * Tracks whether cedrus_device_run() has claimed sunxi_ve_sem and is still
++ * waiting for the completion IRQ. Set to 1 right after down(), cleared by
++ * cedrus_irq() before up(). Lets the stale-ctx path know whether it owes
++ * an up() — calling up() unconditionally would corrupt the semaphore count
++ * when cedrus_irq fires from a stray AVC interrupt with no decode pending.
++ */
++atomic_t cedrus_dec_inflight = ATOMIC_INIT(0);
++EXPORT_SYMBOL_GPL(cedrus_dec_inflight);
++
++/*
++ * Encoder side of the shared VE IRQ line. sunxi-venc has no DT IRQ of its
++ * own — the AVC engine asserts on the cedrus-owned IRQ 16. The encoder
++ * pre-arms cedrus_enc_inflight before triggering, then waits on
++ * sunxi_venc_done. cedrus_irq captures the AVC status word and signals
++ * the completion so the encoder can read VLE_LENGTH after the wait.
++ */
++atomic_t cedrus_enc_inflight = ATOMIC_INIT(0);
++EXPORT_SYMBOL_GPL(cedrus_enc_inflight);
++
++DECLARE_COMPLETION(sunxi_venc_done);
++EXPORT_SYMBOL_GPL(sunxi_venc_done);
++
++u32 sunxi_venc_last_status;
++EXPORT_SYMBOL_GPL(sunxi_venc_last_status);
++
++/* Bound for cedrus decode-IRQ watchdog. 4K H264 should complete in ~25ms;
++ * 250ms is well past the worst-case real frame and short enough that
++ * userspace can recover before its own poll() timeout fires. */
++#define CEDRUS_DEC_WATCHDOG_MS	250
++
++/*
++ * Recovery work scheduled by the decode watchdog timer. Runs in process
++ * context (workqueue), where it is safe to call reset_control_assert/
++ * deassert and the v4l2-m2m completion helpers.
++ *
++ * Why the deep reset matters: empirically a single mis-decoded frame
++ * leaves the T527 VE engine internal state machine wedged — every
++ * subsequent decode also fails to assert IRQ. Writing VE_MODE_DISABLED
++ * alone is not enough. Asserting and deasserting the VE reset line
++ * fully clears the wedge so the next frame can succeed.
++ */
++static void cedrus_dec_reset_work_fn(struct work_struct *w)
++{
++	struct cedrus_dev *dev = container_of(w, struct cedrus_dev,
++					      dec_reset_work);
++	struct cedrus_ctx *ctx;
++
++	if (dev->rstc) {
++		reset_control_assert(dev->rstc);
++		udelay(10);
++		reset_control_deassert(dev->rstc);
++	} else {
++		/* No reset control wired — at least drop the engine into the
++		 * disabled mode so the next cedrus_engine_enable() has a clean
++		 * slate to write. */
++		cedrus_engine_disable(dev);
++	}
++
++	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
++	if (ctx) {
++		if (ctx->current_codec < CEDRUS_CODEC_LAST &&
++		    dev->dec_ops[ctx->current_codec]) {
++			dev->dec_ops[ctx->current_codec]->irq_disable(ctx);
++			dev->dec_ops[ctx->current_codec]->irq_clear(ctx);
++		}
++		if (ctx->current_req) {
++			v4l2_ctrl_request_complete(ctx->current_req, &ctx->hdl);
++			ctx->current_req = NULL;
++		}
++		v4l2_m2m_buf_done_and_job_finish(dev->m2m_dev, ctx->fh.m2m_ctx,
++						 VB2_BUF_STATE_ERROR);
++	}
++
++	if (atomic_xchg(&cedrus_dec_inflight, 0))
++		up(&sunxi_ve_sem);
++}
++
++/*
++ * Decode watchdog timer callback. Runs in soft-IRQ context when the
++ * cedrus completion IRQ failed to fire within CEDRUS_DEC_WATCHDOG_MS
++ * after cedrus_device_run() armed the timer. The recovery itself (HW
++ * reset, buf_done, sem release) must run in sleepable context, so all
++ * we do here is log and kick the reset workqueue.
++ */
++static void cedrus_dec_watchdog_fn(struct timer_list *t)
++{
++	struct cedrus_dev *dev = from_timer(dev, t, dec_watchdog);
++
++	v4l2_err(&dev->v4l2_dev,
++		 "decode watchdog: HW did not assert IRQ within %d ms — aborting + resetting VE\n",
++		 CEDRUS_DEC_WATCHDOG_MS);
++
++	schedule_work(&dev->dec_reset_work);
++}
++
++void cedrus_dec_watchdog_start(struct cedrus_dev *dev)
++{
++	mod_timer(&dev->dec_watchdog,
++		  jiffies + msecs_to_jiffies(CEDRUS_DEC_WATCHDOG_MS));
++}
++EXPORT_SYMBOL_GPL(cedrus_dec_watchdog_start);
++
++void cedrus_dec_watchdog_cancel(struct cedrus_dev *dev)
++{
++	del_timer(&dev->dec_watchdog);
++}
++EXPORT_SYMBOL_GPL(cedrus_dec_watchdog_cancel);
++
++/*
++ * The VE interrupt line belongs to cedrus. The poll-mode sunxi-venc encoder
++ * still makes the AVC engine assert it on encode-done, and cedrus_irq cannot
++ * clear an interrupt with no decode in flight — left unhandled it storms and
++ * the kernel disables the line ("irq N: nobody cared"), killing decode. The
++ * encoder masks the line for the duration of an encode via these helpers.
++ */
++static int cedrus_ve_irq = -1;
++
++void sunxi_ve_irq_disable(void)
++{
++	if (cedrus_ve_irq > 0)
++		disable_irq(cedrus_ve_irq);
++}
++EXPORT_SYMBOL_GPL(sunxi_ve_irq_disable);
++
++void sunxi_ve_irq_enable(void)
++{
++	if (cedrus_ve_irq > 0)
++		enable_irq(cedrus_ve_irq);
++}
++EXPORT_SYMBOL_GPL(sunxi_ve_irq_enable);
++
+ int cedrus_engine_enable(struct cedrus_ctx *ctx, enum cedrus_codec codec)
+ {
+ 	u32 reg = 0;
+@@ -142,16 +286,60 @@
+ 	enum vb2_buffer_state state;
+ 	enum cedrus_irq_status status;
+ 
++	/*
++	 * Read + w1c-ack any latched AVC_STATUS bits up front. The AVC engine
++	 * asserts the shared VE IRQ line whenever it finishes an encode; cedrus
++	 * does not otherwise care about those bits. Capturing the value lets
++	 * the (M1) encoder-completion dispatch below report SUCCESS / DONE bits
++	 * back to sunxi-venc before the kernel clears them.
++	 */
++	{
++		u32 avc_status = cedrus_read(dev, VE_AVC_STATUS);
++
++		cedrus_write(dev, VE_AVC_STATUS, avc_status);
++
++		/*
++		 * If sunxi-venc pre-armed cedrus_enc_inflight before triggering
++		 * its encode, this IRQ is the encode-done signal it is waiting
++		 * for. Hand off the status word and complete; the encoder will
++		 * read VLE_LENGTH and validate after wait_for_completion returns.
++		 */
++		if (atomic_xchg(&cedrus_enc_inflight, 0)) {
++			sunxi_venc_last_status = avc_status;
++			complete(&sunxi_venc_done);
++			return IRQ_HANDLED;
++		}
++	}
++
+ 	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
+ 	if (!ctx) {
++		/*
++		 * Two scenarios reach here:
++		 *  (a) ctx released during in-flight decode (cleanup race) —
++		 *      cedrus_dec_inflight == 1, so we owe an up().
++		 *  (b) Stray IRQ from a finished encode (encoder failed to
++		 *      clear AVC_STATUS). cedrus_dec_inflight == 0; do NOT
++		 *      up() — sem isn't held by us. AVC_STATUS already acked
++		 *      above so the shared IRQ line is low.
++		 */
++		if (atomic_xchg(&cedrus_dec_inflight, 0))
++			up(&sunxi_ve_sem);
+ 		v4l2_err(&dev->v4l2_dev,
+ 			 "Instance released before the end of transaction\n");
+ 		return IRQ_NONE;
+ 	}
+ 
+ 	status = dev->dec_ops[ctx->current_codec]->irq_status(ctx);
+-	if (status == CEDRUS_IRQ_NONE)
+-		return IRQ_NONE;
++	if (status == CEDRUS_IRQ_NONE) {
++		/*
++		 * Stray AVC IRQ while a decode is pending: AVC_STATUS was
++		 * already acked above. Decode is still in flight — do NOT
++		 * touch inflight or sem. Return IRQ_HANDLED so genirq does
++		 * not count this as spurious (which would eventually mask
++		 * the line via "nobody cared").
++		 */
++		return IRQ_HANDLED;
++	}
+ 
+ 	dev->dec_ops[ctx->current_codec]->irq_disable(ctx);
+ 	dev->dec_ops[ctx->current_codec]->irq_clear(ctx);
+@@ -174,6 +362,19 @@
+ 	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
+ 					 state);
+ 
++	/*
++	 * HW completion landed — cancel the watchdog before releasing the
++	 * engine so a delayed-fire of the timer can't run after up().
++	 */
++	del_timer(&dev->dec_watchdog);
++
++	/*
++	 * HW transaction done — clear the in-flight flag *before* up() so a
++	 * subsequent stray IRQ doesn't observe (inflight==1, sem==released).
++	 */
++	atomic_set(&cedrus_dec_inflight, 0);
++	up(&sunxi_ve_sem);
++
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -258,6 +459,11 @@
+ 		return ret;
+ 	}
+ 
++	cedrus_ve_irq = irq_dec;
++
++	timer_setup(&dev->dec_watchdog, cedrus_dec_watchdog_fn, 0);
++	INIT_WORK(&dev->dec_reset_work, cedrus_dec_reset_work_fn);
++
+ 	ret = of_reserved_mem_device_init(dev->dev);
+ 	if (ret && ret != -ENODEV) {
+ 		dev_err(dev->dev, "Failed to reserve memory\n");
+@@ -364,6 +570,9 @@
+ 
+ void cedrus_hw_remove(struct cedrus_dev *dev)
+ {
++	del_timer_sync(&dev->dec_watchdog);
++	cancel_work_sync(&dev->dec_reset_work);
++
+ 	sunxi_enable_device_iommu(3, false);
+ 	pm_runtime_disable(dev->dev);
+ 	if (!pm_runtime_status_suspended(dev->dev))

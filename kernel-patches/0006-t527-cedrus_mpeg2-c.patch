@@ -1,0 +1,14 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+@@ -72,6 +72,11 @@
+ 	/* Activate MPEG engine. */
+ 	cedrus_engine_enable(ctx, CEDRUS_CODEC_MPEG2);
+ 
++	/* T527 BSP cedrus: engine_enable resets format regs.
++	 * Re-apply destination format AFTER engine_enable so SECONDARY
++	 * out format (used by MC for inter-frame ref reads) is correct. */
++	cedrus_dst_format_set(dev, &ctx->dst_fmt);
++
+ 	/* Set intra quantisation matrix. */
+ 	matrix = quantisation->intra_quantiser_matrix;
+ 	for (i = 0; i < 64; i++) {

@@ -127,44 +127,22 @@ cp dts-patches/0007-t527-dts.patch \
 | `0007-t527-dts.patch` | cedrus node: register range, clock names, IOMMU master 2 binding, disables ve1 |
 | `0020-t527-venc-dts.patch` | `video-encoder@1c0e000` node for sunxi-venc |
 
-### Step 2 — Apply the driver source as patches
+### Step 2 — Copy the kernel patches
 
-Copy cedrus and sunxi-venc files into the kernel tree, then generate patches:
-
-```sh
-KDIR=~/orangepi-build/kernel/orange-pi-5.15-sun55iw3
-PDIR=~/orangepi-build/userpatches/kernel/sun55iw3-current
-
-# cedrus
-cp cedrus/*.c cedrus/*.h cedrus/Kconfig cedrus/Makefile \
-   $KDIR/drivers/staging/media/sunxi/cedrus/
-
-# sunxi-venc (new driver — create the directory)
-mkdir -p $KDIR/drivers/staging/media/sunxi/sunxi-venc
-cp sunxi-venc/*.c sunxi-venc/*.h sunxi-venc/Kconfig sunxi-venc/Makefile \
-   $KDIR/drivers/staging/media/sunxi/sunxi-venc/
-```
-
-Then generate and save the patches (orangepi-build wipes the tree on each build, so all changes must be in userpatches):
+This repo includes all 24 ready-to-apply patches in `kernel-patches/`. Copy them all into orangepi-build:
 
 ```sh
-cd $KDIR
-
-# cedrus patch
-git diff HEAD -- drivers/staging/media/sunxi/cedrus/ \
-  | grep -v "^diff --git\|^index " \
-  > $PDIR/0005-cedrus-t527-all.patch
-
-# sunxi-venc Kconfig + Makefile entries (modify sunxi/{Kconfig,Makefile} to add entries)
-# sunxi-venc new files
-for f in sunxi_venc.c sunxi_venc.h sunxi_venc_regs.h sunxi_venc_h264.c sunxi_venc_video.c sunxi_venc_ctrls.c Kconfig Makefile; do
-  diff -u /dev/null drivers/staging/media/sunxi/sunxi-venc/$f \
-    --label "/dev/null" \
-    --label "b/drivers/staging/media/sunxi/sunxi-venc/$f"
-done > $PDIR/0006-sunxi-venc-t527.patch
+cp kernel-patches/*.patch \
+   ~/orangepi-build/userpatches/kernel/sun55iw3-current/
 ```
 
-> **Tip:** The pre-built patch files from this repo's `dts-patches/` are ready to use directly. For the driver patches, refer to [cedrus-t527](https://github.com/matheusants/cedrus-t527) and this repo as the authoritative source.
+orangepi-build applies patches alphabetically from `userpatches/kernel/sun55iw3-current/` before each build.
+
+**Group A — cedrus decode (0001-0009):** T527 variant, 792 MHz clock, NV12/TILED formats, IOMMU master binding, vb2_dma_sg mmap, cedrus DT node.
+
+**Group B — sunxi-venc + cedrus VE-sharing (0010-0024):** new encoder driver files, venc DT node, cedrus coordination patches (semaphore, watchdog, IRQ dispatch, UAF fix).
+
+> The DTS patches (`0007`, `0020`) are duplicated in `dts-patches/` for convenience.
 
 ### Step 3 — Enable the sunxi-venc Kconfig option
 

@@ -1,0 +1,55 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -141,7 +141,10 @@
+ 	if (output >= 0)
+ 		position = output;
+ 	else
+-		position = find_first_zero_bit(&used_dpbs, CEDRUS_H264_FRAME_NUM);
++		/* Skip position 0: T527 cedrus appears to treat sram_byte=0 in
++		 * REF_LIST as "no ref" / NULL. Any ref pointing to position 0
++		 * fails MC. Reserve position 0 unused; assign from 1 upward. */
++		position = find_next_zero_bit(&used_dpbs, CEDRUS_H264_FRAME_NUM, 1);
+ 
+ 	output_buf = vb2_to_cedrus_buffer(&run->dst->vb2_buf);
+ 	output_buf->codec.h264.position = position;
+@@ -343,7 +346,12 @@
+ 		     VE_H264_VLD_ADDR_FIRST | VE_H264_VLD_ADDR_VALID |
+ 		     VE_H264_VLD_ADDR_LAST);
+ 
+-	if (ctx->src_fmt.width > 2048) {
++	if (ctx->src_fmt.width > 2048 ||
++	    (dev->capabilities & CEDRUS_CAPABILITY_NO_SRAM)) {
++		/* T527 BSP has no internal SRAM for intrapred/dblk —
++		 * force MIXED_RAM (DRAM-backed) for all widths. Buffers
++		 * allocated unconditionally in cedrus_h264_start when
++		 * NO_SRAM capability is set. */
+ 		cedrus_write(dev, VE_BUF_CTRL,
+ 			     VE_BUF_CTRL_INTRAPRED_MIXED_RAM |
+ 			     VE_BUF_CTRL_DBLK_MIXED_RAM);
+@@ -500,6 +508,11 @@
+ 
+ 	cedrus_engine_enable(ctx, CEDRUS_CODEC_H264);
+ 
++	/* T527 BSP cedrus: engine_enable appears to reset format regs.
++	 * Re-apply destination format AFTER engine_enable so MC has
++	 * correct chroma/stride config for ref reads. */
++	cedrus_dst_format_set(dev, &ctx->dst_fmt);
++
+ 	cedrus_write(dev, VE_H264_SDROT_CTRL, 0);
+ 	cedrus_write(dev, VE_H264_EXTRA_BUFFER1,
+ 		     ctx->codec.h264.pic_info_buf_dma);
+@@ -591,10 +604,12 @@
+ 		goto err_neighbor_buf;
+ 	}
+ 
+-	if (ctx->src_fmt.width > 2048) {
++	if (ctx->src_fmt.width > 2048 ||
++	    (dev->capabilities & CEDRUS_CAPABILITY_NO_SRAM)) {
+ 		/*
+ 		 * Formulas for deblock and intra prediction buffer sizes
+-		 * are taken from CedarX source.
++		 * are taken from CedarX source. Also allocated unconditionally
++		 * on T527 BSP (NO_SRAM cap) since no internal SRAM available.
+ 		 */
+ 
+ 		ctx->codec.h264.deblk_buf_size =

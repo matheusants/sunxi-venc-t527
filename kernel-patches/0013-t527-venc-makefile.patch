@@ -1,0 +1,7 @@
+--- /dev/null
++++ b/drivers/staging/media/sunxi/sunxi-venc/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_VIDEO_SUNXI_VENC) += sunxi-venc.o
++
++sunxi-venc-y = sunxi_venc.o sunxi_venc_video.o sunxi_venc_h264.o sunxi_venc_ctrls.o

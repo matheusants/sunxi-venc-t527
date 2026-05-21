@@ -1,0 +1,26 @@
+--- a/arch/arm64/boot/dts/allwinner/sun55i-t527-orangepi-4a.dts
++++ b/arch/arm64/boot/dts/allwinner/sun55i-t527-orangepi-4a.dts
+@@ -2940,6 +2940,23 @@
+ 	status = "disabled";
+ };
+ 
++/* Path B open-source H264 encoder: sunxi-venc stateful V4L2 M2M driver.
++ * Shares the VE register block with the cedrus decoder (mapped non-exclusive).
++ */
++/ {
++	venc: video-encoder@1c0e000 {
++		compatible = "allwinner,sunxi-venc-h264";
++		reg = <0x0 0x01c0e000 0x0 0x1000>;
++		clocks = <&ccu CLK_BUS_VE>, <&ccu CLK_VE>, <&ccu CLK_VE_MBUS_GATE>;
++		clock-names = "ahb", "mod", "ram";
++		resets = <&ccu RST_BUS_VE>;
++		iommus = <&mmu_aw 2 1>;
++		ve-supply = <&reg_dcdc2>;
++		power-domains = <&pd1 A523_PCK_VE>;
++		status = "okay";
++	};
++};
++
+ /* audio dirver module -> audio codec */
+ &codec {
+ 	//tx-hub-en;

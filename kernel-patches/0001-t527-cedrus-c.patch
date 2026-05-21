@@ -1,0 +1,51 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -554,6 +554,16 @@
+ 	.mod_rate	= 600000000,
+ };
+ 
++static const struct cedrus_variant sun55i_t527_cedrus_variant = {
++	.capabilities	= CEDRUS_CAPABILITY_UNTILED |
++			  CEDRUS_CAPABILITY_MPEG2_DEC |
++			  CEDRUS_CAPABILITY_H264_DEC |
++			  CEDRUS_CAPABILITY_H265_DEC |
++			  CEDRUS_CAPABILITY_VP8_DEC |
++			  CEDRUS_CAPABILITY_NO_SRAM,
++	.mod_rate	= 792000000,
++};
++
+ static const struct of_device_id cedrus_dt_match[] = {
+ 	{
+ 		.compatible = "allwinner,sun4i-a10-video-engine",
+@@ -595,6 +605,10 @@
+ 		.compatible = "allwinner,sun50i-h6-video-engine",
+ 		.data = &sun50i_h6_cedrus_variant,
+ 	},
++	{
++		.compatible = "allwinner,sunxi-cedar-ve",
++		.data = &sun55i_t527_cedrus_variant,
++	},
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, cedrus_dt_match);
+@@ -615,6 +629,20 @@
+ };
+ module_platform_driver(cedrus_driver);
+ 
++/*
++ * (M14) Optional VE mod clock override. When 0 (default) the per-variant
++ * mod_rate from cedrus_variant is applied (600 MHz on T527). When non-zero
++ * this rate is requested instead — useful to validate the silicon ceiling
++ * above the conservative BSP value. Read at probe time only. Pass with
++ *   modprobe sunxi_cedrus clk_hz=720000000
++ * or
++ *   /etc/modprobe.d/sunxi-cedrus.conf : options sunxi_cedrus clk_hz=720000000
++ */
++unsigned long cedrus_clk_hz_override;
++EXPORT_SYMBOL_GPL(cedrus_clk_hz_override);
++module_param_named(clk_hz, cedrus_clk_hz_override, ulong, 0444);
++MODULE_PARM_DESC(clk_hz, "Override VE mod clock rate in Hz (0 = use variant default)");
++
+ MODULE_LICENSE("GPL v2");
+ MODULE_AUTHOR("Florent Revest <florent.revest@free-electrons.com>");
+ MODULE_AUTHOR("Paul Kocialkowski <paul.kocialkowski@bootlin.com>");

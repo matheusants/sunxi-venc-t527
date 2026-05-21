@@ -1,0 +1,147 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -23,6 +23,7 @@
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+ #include <linux/soc/sunxi/sunxi_sram.h>
++#include <sunxi-iommu.h>
+ 
+ #include <media/videobuf2-core.h>
+ #include <media/v4l2-mem2mem.h>
+@@ -88,9 +89,23 @@
+ 	case V4L2_PIX_FMT_NV12:
+ 		chroma_size = ALIGN(width, 16) * ALIGN(height, 16) / 2;
+ 
+-		reg = VE_PRIMARY_OUT_FMT_NV12;
++		/* Set both PRIMARY (output write) and SECONDARY_OUT_FMT_EXT
++		 * (used for inter-frame ref read) to NV12 so the format the
++		 * HW writes the reconstructed frame in matches what it later
++		 * reads as a reference. Without this, secondary defaults to
++		 * TILED_32 -> ref reads interpret NV12 storage as tiled =
++		 * garbage motion comp on all P/B frames.
++		 */
++		reg = VE_PRIMARY_OUT_FMT_NV12 | VE_SECONDARY_OUT_FMT_EXT_NV12;
+ 		cedrus_write(dev, VE_PRIMARY_OUT_FMT, reg);
+ 
++		/* CHROMA_BUF_LEN: bits 31..30 select SECONDARY format.
++		 * Set to EXT to point at the EXT bits we set above, OR
++		 * the chroma buf length in bits 27..0.
++		 */
++		reg = (chroma_size / 2) | VE_SECONDARY_OUT_FMT_EXT;
++		cedrus_write(dev, VE_CHROMA_BUF_LEN, reg);
++
+ 		reg = chroma_size / 2;
+ 		cedrus_write(dev, VE_PRIMARY_CHROMA_BUF_LEN, reg);
+ 
+@@ -101,12 +116,21 @@
+ 		break;
+ 	case V4L2_PIX_FMT_SUNXI_TILED_NV12:
+ 	default:
++		chroma_size = ALIGN(width, 16) * ALIGN(height, 16) / 2;
++
+ 		reg = VE_PRIMARY_OUT_FMT_TILED_32_NV12;
+ 		cedrus_write(dev, VE_PRIMARY_OUT_FMT, reg);
+ 
+-		reg = VE_SECONDARY_OUT_FMT_TILED_32_NV12;
++		reg = VE_SECONDARY_OUT_FMT_TILED_32_NV12 |
++		      VE_CHROMA_BUF_LEN_SDRT(chroma_size / 2);
+ 		cedrus_write(dev, VE_CHROMA_BUF_LEN, reg);
+ 
++		cedrus_write(dev, VE_PRIMARY_CHROMA_BUF_LEN, chroma_size / 2);
++
++		reg = VE_PRIMARY_FB_LINE_STRIDE_LUMA(ALIGN(width, 16)) |
++		      VE_PRIMARY_FB_LINE_STRIDE_CHROMA(ALIGN(width, 16));
++		cedrus_write(dev, VE_PRIMARY_FB_LINE_STRIDE, reg);
++
+ 		break;
+ 	}
+ }
+@@ -137,6 +161,16 @@
+ 	else
+ 		state = VB2_BUF_STATE_DONE;
+ 
++	/*
++	 * Complete the request AFTER HW finishes, so userspace poll
++	 * returns POLLPRI only once the frame is actually decoded.
++	 * This prevents the next frame's device_run from overwriting
++	 * VE registers while the current frame is still in progress.
++	 */
++	if (ctx->current_req)
++		v4l2_ctrl_request_complete(ctx->current_req, &ctx->hdl);
++	ctx->current_req = NULL;
++
+ 	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
+ 					 state);
+ 
+@@ -231,11 +265,13 @@
+ 		return ret;
+ 	}
+ 
+-	ret = sunxi_sram_claim(dev->dev);
+-	if (ret) {
+-		dev_err(dev->dev, "Failed to claim SRAM\n");
++	if (!(dev->capabilities & CEDRUS_CAPABILITY_NO_SRAM)) {
++		ret = sunxi_sram_claim(dev->dev);
++		if (ret) {
++			dev_err(dev->dev, "Failed to claim SRAM\n");
+ 
+-		goto err_mem;
++			goto err_mem;
++		}
+ 	}
+ 
+ 	dev->ahb_clk = devm_clk_get(dev->dev, "ahb");
+@@ -278,11 +314,27 @@
+ 		goto err_sram;
+ 	}
+ 
+-	ret = clk_set_rate(dev->mod_clk, variant->mod_rate);
+-	if (ret) {
+-		dev_err(dev->dev, "Failed to set clock rate\n");
+-
+-		goto err_sram;
++	{
++		/* (M14) Optional VE mod clock override via cedrus.clk_hz module
++		 * param — exported from cedrus.c. 0 = use variant default
++		 * (600 MHz on T527). Lets us validate the silicon ceiling
++		 * without recompiling. */
++		extern unsigned long cedrus_clk_hz_override;
++		unsigned long rate = cedrus_clk_hz_override ?
++				     cedrus_clk_hz_override :
++				     variant->mod_rate;
++
++		ret = clk_set_rate(dev->mod_clk, rate);
++		if (ret) {
++			dev_err(dev->dev,
++				"Failed to set VE clock rate %lu Hz: %d\n",
++				rate, ret);
++			goto err_sram;
++		}
++		dev_info(dev->dev,
++			 "VE mod clock requested %lu Hz, got %lu Hz%s\n",
++			 rate, clk_get_rate(dev->mod_clk),
++			 cedrus_clk_hz_override ? " (clk_hz override)" : "");
+ 	}
+ 
+ 	pm_runtime_enable(dev->dev);
+@@ -292,6 +344,12 @@
+ 			goto err_pm;
+ 	}
+ 
++	/* T527 VE has two MBUS masters: VE_MBUS0 (master 2) for output DMA
++	 * writes, VE_MBUS1 (master 3) for MC reference reads. DTS iommus
++	 * property binds only master 2 (sunxi_iommu_of_xlate stores one master
++	 * per device). Explicitly enable master 3 so MC reads are translated. */
++	sunxi_enable_device_iommu(3, true);
++
+ 	return 0;
+ 
+ err_pm:
+@@ -306,6 +364,7 @@
+ 
+ void cedrus_hw_remove(struct cedrus_dev *dev)
+ {
++	sunxi_enable_device_iommu(3, false);
+ 	pm_runtime_disable(dev->dev);
+ 	if (!pm_runtime_status_suspended(dev->dev))
+ 		cedrus_hw_suspend(dev->dev);

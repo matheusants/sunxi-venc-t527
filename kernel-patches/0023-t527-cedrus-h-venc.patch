@@ -1,0 +1,46 @@
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -26,6 +26,21 @@
+ #include <linux/scatterlist.h>
+ #include <linux/iopoll.h>
+ #include <linux/platform_device.h>
++#include <linux/timer.h>
++#include <linux/workqueue.h>
++#include <linux/completion.h>
++#include <linux/atomic.h>
++
++/*
++ * Shared with sunxi-venc: the encoder pre-arms cedrus_enc_inflight and
++ * waits on sunxi_venc_done. cedrus_irq signals the completion when the
++ * AVC engine asserts its done bit on the shared VE IRQ line; the captured
++ * status word lives in sunxi_venc_last_status so the encoder can detect
++ * the SUCCESS vs. DONE bits (cedrus_irq w1c-clears them before returning).
++ */
++extern atomic_t cedrus_enc_inflight;
++extern struct completion sunxi_venc_done;
++extern u32 sunxi_venc_last_status;
+ 
+ #define CEDRUS_NAME			"cedrus"
+ 
+@@ -198,6 +213,21 @@
+ 	struct reset_control	*rstc;
+ 
+ 	unsigned int		capabilities;
++
++	/*
++	 * Watchdog for decode IRQ timeout. cedrus_device_run() arms the timer
++	 * after down(sunxi_ve_sem). cedrus_irq() cancels it on completion. If
++	 * the timer fires the HW silently failed to assert its IRQ — recover
++	 * by aborting the in-flight buffer and releasing the engine.
++	 *
++	 * The timer fires in soft-IRQ context, where we cannot call
++	 * reset_control_reset() (it may sleep) nor v4l2_m2m_buf_done_and_job_finish()
++	 * safely on every kernel build. The timer therefore only kicks
++	 * dec_reset_work, which runs the full recovery sequence in process
++	 * context.
++	 */
++	struct timer_list	dec_watchdog;
++	struct work_struct	dec_reset_work;
+ };
+ 
+ extern struct cedrus_dec_ops cedrus_dec_ops_mpeg2;
