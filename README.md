@@ -65,6 +65,110 @@ VE-sharing additions:
 
 Practical Jellyfin policy: **1× realtime 4K transcode max**, or **2× ≤720p concurrent near-realtime**.
 
+## Installation with orangepi-build
+
+### Step 1 — Apply the DTS patches (required)
+
+Two patches must be applied to the OrangePi 4A device tree before building the kernel.
+Using [orangepi-build](https://github.com/orangepi-xunlong/orangepi-build):
+
+```sh
+# Copy both DTS patches into orangepi-build userpatches
+cp dts-patches/0007-t527-dts.patch \
+   dts-patches/0020-t527-venc-dts.patch \
+   ~/orangepi-build/userpatches/kernel/sun55iw3-current/
+```
+
+| Patch | What it adds |
+|---|---|
+| `0007-t527-dts.patch` | cedrus node: register range, clock names, IOMMU master 2 binding, disables ve1 |
+| `0020-t527-venc-dts.patch` | `video-encoder@1c0e000` node for sunxi-venc |
+
+### Step 2 — Apply the driver source as patches
+
+Copy cedrus and sunxi-venc files into the kernel tree, then generate patches:
+
+```sh
+KDIR=~/orangepi-build/kernel/orange-pi-5.15-sun55iw3
+PDIR=~/orangepi-build/userpatches/kernel/sun55iw3-current
+
+# cedrus
+cp cedrus/*.c cedrus/*.h cedrus/Kconfig cedrus/Makefile \
+   $KDIR/drivers/staging/media/sunxi/cedrus/
+
+# sunxi-venc (new driver — create the directory)
+mkdir -p $KDIR/drivers/staging/media/sunxi/sunxi-venc
+cp sunxi-venc/*.c sunxi-venc/*.h sunxi-venc/Kconfig sunxi-venc/Makefile \
+   $KDIR/drivers/staging/media/sunxi/sunxi-venc/
+```
+
+Then generate and save the patches (orangepi-build wipes the tree on each build, so all changes must be in userpatches):
+
+```sh
+cd $KDIR
+
+# cedrus patch
+git diff HEAD -- drivers/staging/media/sunxi/cedrus/ \
+  | grep -v "^diff --git\|^index " \
+  > $PDIR/0005-cedrus-t527-all.patch
+
+# sunxi-venc Kconfig + Makefile entries (modify sunxi/{Kconfig,Makefile} to add entries)
+# sunxi-venc new files
+for f in sunxi_venc.c sunxi_venc.h sunxi_venc_regs.h sunxi_venc_h264.c sunxi_venc_video.c sunxi_venc_ctrls.c Kconfig Makefile; do
+  diff -u /dev/null drivers/staging/media/sunxi/sunxi-venc/$f \
+    --label "/dev/null" \
+    --label "b/drivers/staging/media/sunxi/sunxi-venc/$f"
+done > $PDIR/0006-sunxi-venc-t527.patch
+```
+
+> **Tip:** The pre-built patch files from this repo's `dts-patches/` are ready to use directly. For the driver patches, refer to [cedrus-t527](https://github.com/matheusants/cedrus-t527) and this repo as the authoritative source.
+
+### Step 3 — Enable the sunxi-venc Kconfig option
+
+Add to your kernel config (e.g. `~/orangepi-build/external/config/kernel/linux-5.15-sun55iw3-current.config`):
+
+```
+CONFIG_VIDEO_SUNXI_VENC=m
+```
+
+### Step 4 — Rebuild and install the kernel
+
+```sh
+cd ~/orangepi-build
+sudo ./build.sh BOARD=orangepi4a BRANCH=current BUILD_OPT=kernel KERNEL_CONFIGURE=no
+sudo dpkg -i output/debs/linux-image-*.deb output/debs/linux-dtb-*.deb
+sudo reboot
+```
+
+After reboot, verify both devices appear:
+
+```sh
+ls /dev/video*   # should include /dev/video1 (cedrus) and /dev/video2 (sunxi-venc)
+```
+
+### Step 5 — Build and install the VAAPI driver
+
+```sh
+git clone https://github.com/matheusants/libva-v4l2-request
+cd libva-v4l2-request
+meson setup build && ninja -C build && sudo ninja -C build install
+```
+
+### Step 6 — Test
+
+```sh
+# Decode test
+LIBVA_DRIVER_NAME=v4l2_request LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri \
+  ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+  -i input.mp4 -vframes 30 -f null -
+
+# 4K → 720p transcode
+LIBVA_DRIVER_NAME=v4l2_request LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri \
+  ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+  -hwaccel_output_format vaapi -i input_4k.mp4 \
+  -vf scale_vaapi=w=1280:h=720 -c:v h264_vaapi -b:v 6M output_720p.mp4
+```
+
 ## Related repos
 
 - [libva-v4l2-request](https://github.com/matheusants/libva-v4l2-request) — VAAPI driver (userspace)
