@@ -1,0 +1,593 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Allwinner sunxi H264 hardware encoder — encoder core.
+ *
+ * M1: single-IDR encode. Programs the T527 VE AVC encode engine for one
+ * I-frame — scratch-buffer allocation, HW bit-writer SPS/PPS/IDR-slice
+ * headers, register setup from the vendor trace, trigger and poll-mode
+ * completion.
+ *
+ * The register image replicates path-a-cedar-bsp-enc/VE_REG_TRACE.md snap 3
+ * (the working vendor libvenc_h264.so capture). The HW bit-writer logic is
+ * ported from the GPLv2 H3 reference encoder (Jens Kuske, h264enc.c).
+ *
+ * P-frames, rate control and userspace controls land in M2/M3.
+ */
+
+#include <linux/delay.h>
+#include <linux/dma-mapping.h>
+#include <linux/sizes.h>
+#include <linux/completion.h>
+#include <linux/atomic.h>
+#include <linux/jiffies.h>
+
+#include <media/videobuf2-dma-contig.h>
+
+#include "sunxi_venc.h"
+#include "sunxi_venc_regs.h"
+
+/* M1: shared encode completion path — cedrus_irq signals us via these. */
+extern atomic_t cedrus_enc_inflight;
+extern struct completion sunxi_venc_done;
+extern u32 sunxi_venc_last_status;
+
+#define SUNXI_VENC_WAIT_TIMEOUT_MS	300
+
+/*
+ * The slice header carries the absolute QP as pic_init_qp + slice_qp_delta.
+ * PPS pic_init_qp is fixed at 26 (pic_init_qp_minus26 = 0); each frame's QP
+ * is then expressed purely as slice_qp_delta, so per-frame rate control needs
+ * no PPS rewrite.
+ */
+#define SUNXI_VENC_PIC_INIT_QP		26
+
+/*
+ * VE_AVC_QP register: low byte = luma QP, upper bits constant. The upper
+ * field is 0x08000900 (multi-frame 1280x720 vendor trace, IDR and P);
+ * an earlier 320x240 fixed-QP trace mis-read it as 0x08000500.
+ */
+#define SUNXI_VENC_QP_REG(qp)		(0x08000900 | ((qp) & 0xff))
+
+/* H264 valid QP range. */
+#define SUNXI_VENC_QP_LO		1
+#define SUNXI_VENC_QP_HI		51
+
+/*
+ * Encode completion: (M1) wait_for_completion_timeout on sunxi_venc_done.
+ * cedrus_irq signals from the shared VE IRQ line — see cedrus_hw.c. Bound
+ * SUNXI_VENC_WAIT_TIMEOUT_MS (300 ms) is wide margin over a 4K frame
+ * (~40 ms at 4K@25fps).
+ */
+
+#define VENC_ALIGN(x, a)	ALIGN((x), (a))
+
+/* ---- HW bit-writer (ported from H3 h264enc.c) ---------------------------- */
+
+static void venc_put_bits(struct sunxi_venc_dev *dev, u32 val, int num)
+{
+	venc_write(dev, VE_AVC_BASIC_BITS, val);
+	venc_write(dev, VE_AVC_TRIGGER, VE_AVC_TRIGGER_BITS(num));
+}
+
+static void venc_put_ue(struct sunxi_venc_dev *dev, u32 val)
+{
+	val++;
+	venc_put_bits(dev, val, (32 - __builtin_clz(val)) * 2 - 1);
+}
+
+static void venc_put_se(struct sunxi_venc_dev *dev, int val)
+{
+	u32 x = (u32)(2 * val - 1);
+
+	if ((s32)x < 0)
+		x = ~x;
+	venc_put_ue(dev, x);
+}
+
+static void venc_put_start_code(struct sunxi_venc_dev *dev, u32 nal_ref_idc,
+				u32 nal_unit_type)
+{
+	u32 param = venc_read(dev, VE_AVC_PARAM);
+
+	/* disable emulation_prevention_three_byte while emitting the prefix */
+	venc_write(dev, VE_AVC_PARAM, param | VE_AVC_PARAM_NO_EP);
+
+	venc_put_bits(dev, 0, 24);
+	venc_put_bits(dev, 0x100 | (nal_ref_idc << 5) | nal_unit_type, 16);
+
+	venc_write(dev, VE_AVC_PARAM, param);
+}
+
+static void venc_put_rbsp_trailing(struct sunxi_venc_dev *dev)
+{
+	u32 len = venc_read(dev, VE_AVC_VLE_LENGTH);
+	int zero_bits = 8 - ((len + 1) & 0x7);
+
+	venc_put_bits(dev, 1 << zero_bits, zero_bits + 1);
+}
+
+/* ---- H264 header bitstreams --------------------------------------------- */
+
+static void venc_write_sps(struct sunxi_venc_ctx *ctx)
+{
+	struct sunxi_venc_dev *dev = ctx->dev;
+	bool crop = ctx->crop_right || ctx->crop_bottom;
+
+	venc_put_start_code(dev, 3, 7);
+
+	venc_put_bits(dev, ctx->params.profile_idc, 8);
+	venc_put_bits(dev, ctx->params.constraints, 8);
+	venc_put_bits(dev, ctx->params.level_idc, 8);
+
+	venc_put_ue(dev, 0);		/* seq_parameter_set_id */
+	venc_put_ue(dev, 0);		/* log2_max_frame_num_minus4 */
+	venc_put_ue(dev, 2);		/* pic_order_cnt_type */
+	venc_put_ue(dev, 1);		/* max_num_ref_frames */
+	venc_put_bits(dev, 0, 1);	/* gaps_in_frame_num_value_allowed_flag */
+
+	venc_put_ue(dev, ctx->mb_width - 1);
+	venc_put_ue(dev, ctx->mb_height - 1);
+
+	venc_put_bits(dev, 1, 1);	/* frame_mbs_only_flag */
+	venc_put_bits(dev, 0, 1);	/* direct_8x8_inference_flag */
+
+	venc_put_bits(dev, crop, 1);	/* frame_cropping_flag */
+	if (crop) {
+		venc_put_ue(dev, 0);
+		venc_put_ue(dev, ctx->crop_right);
+		venc_put_ue(dev, 0);
+		venc_put_ue(dev, ctx->crop_bottom);
+	}
+
+	venc_put_bits(dev, 0, 1);	/* vui_parameters_present_flag */
+	venc_put_rbsp_trailing(dev);
+}
+
+static void venc_write_pps(struct sunxi_venc_ctx *ctx)
+{
+	struct sunxi_venc_dev *dev = ctx->dev;
+
+	venc_put_start_code(dev, 3, 8);
+
+	venc_put_ue(dev, 0);		/* pic_parameter_set_id */
+	venc_put_ue(dev, 0);		/* seq_parameter_set_id */
+
+	venc_put_bits(dev, ctx->params.cabac, 1);	/* entropy_coding_mode_flag */
+	venc_put_bits(dev, 0, 1);	/* bottom_field_pic_order_present_flag */
+	venc_put_ue(dev, 0);		/* num_slice_groups_minus1 */
+
+	venc_put_ue(dev, 0);		/* num_ref_idx_l0_default_active_minus1 */
+	venc_put_ue(dev, 0);		/* num_ref_idx_l1_default_active_minus1 */
+
+	venc_put_bits(dev, 0, 1);	/* weighted_pred_flag */
+	venc_put_bits(dev, 0, 2);	/* weighted_bipred_idc */
+
+	venc_put_se(dev, 0);		/* pic_init_qp_minus26 (QP base 26) */
+	venc_put_se(dev, 0);		/* pic_init_qs_minus26 */
+	venc_put_se(dev, 0);		/* chroma_qp_index_offset */
+
+	venc_put_bits(dev, 1, 1);	/* deblocking_filter_control_present_flag */
+	venc_put_bits(dev, 0, 1);	/* constrained_intra_pred_flag */
+	venc_put_bits(dev, 0, 1);	/* redundant_pic_cnt_present_flag */
+
+	venc_put_rbsp_trailing(dev);
+}
+
+/*
+ * Slice header. IDR slices use NAL type 5 / slice_type 2 (I); P slices use
+ * NAL type 1 / slice_type 0 (P). h264_frame_num resets to 0 at each IDR.
+ * The frame QP is carried as slice_qp_delta against PPS pic_init_qp (26).
+ */
+static void venc_write_slice_header(struct sunxi_venc_ctx *ctx, bool is_idr,
+				    unsigned int h264_frame_num, unsigned int qp)
+{
+	struct sunxi_venc_dev *dev = ctx->dev;
+
+	if (is_idr)
+		venc_put_start_code(dev, 3, 5);	/* IDR slice NAL */
+	else
+		venc_put_start_code(dev, 2, 1);	/* non-IDR slice NAL */
+
+	venc_put_ue(dev, 0);			/* first_mb_in_slice */
+	venc_put_ue(dev, is_idr ? 2 : 0);	/* slice_type: 2=I, 0=P */
+	venc_put_ue(dev, 0);			/* pic_parameter_set_id */
+
+	venc_put_bits(dev, h264_frame_num & 0xf, 4);	/* frame_num */
+
+	if (is_idr) {
+		venc_put_ue(dev, 0);		/* idr_pic_id */
+	} else {
+		venc_put_bits(dev, 0, 1);	/* num_ref_idx_active_override_flag */
+		venc_put_bits(dev, 0, 1);	/* ref_pic_list_modification_flag_l0 */
+	}
+
+	/* dec_ref_pic_marking */
+	if (is_idr) {
+		venc_put_bits(dev, 0, 1);	/* no_output_of_prior_pics_flag */
+		venc_put_bits(dev, 0, 1);	/* long_term_reference_flag */
+	} else {
+		venc_put_bits(dev, 0, 1);	/* adaptive_ref_pic_marking_mode_flag */
+	}
+
+	/* cabac_init_idc — P/B slices only, when entropy mode is CABAC */
+	if (ctx->params.cabac && !is_idr)
+		venc_put_ue(dev, 0);
+
+	venc_put_se(dev, (int)qp - SUNXI_VENC_PIC_INIT_QP);	/* slice_qp_delta */
+
+	venc_put_ue(dev, 0);			/* disable_deblocking_filter_idc */
+	venc_put_se(dev, 0);			/* slice_alpha_c0_offset_div2 */
+	venc_put_se(dev, 0);			/* slice_beta_offset_div2 */
+}
+
+/* ---- scratch buffers ----------------------------------------------------- */
+
+static int venc_buf_alloc(struct sunxi_venc_ctx *ctx, struct sunxi_venc_buf *b,
+			  size_t size)
+{
+	b->size = PAGE_ALIGN(size);
+	b->cpu = dma_alloc_coherent(ctx->dev->dev, b->size, &b->dma, GFP_KERNEL);
+	if (!b->cpu)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void venc_buf_free(struct sunxi_venc_ctx *ctx, struct sunxi_venc_buf *b)
+{
+	if (b->cpu)
+		dma_free_coherent(ctx->dev->dev, b->size, b->cpu, b->dma);
+	b->cpu = NULL;
+}
+
+void sunxi_venc_h264_stop(struct sunxi_venc_ctx *ctx)
+{
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		venc_buf_free(ctx, &ctx->rec_luma[i]);
+		venc_buf_free(ctx, &ctx->rec_sluma[i]);
+	}
+	venc_buf_free(ctx, &ctx->mb_info);
+	venc_buf_free(ctx, &ctx->enc_extra);
+	venc_buf_free(ctx, &ctx->enc_scratch);
+	venc_buf_free(ctx, &ctx->line_buf);
+	ctx->buffers_ready = false;
+}
+
+/*
+ * Derive geometry from the raw input format and allocate the reconstruction
+ * and per-MB scratch buffers the VE writes during an encode. Buffer-size
+ * formulas follow the H3 reference encoder.
+ */
+int sunxi_venc_h264_start(struct sunxi_venc_ctx *ctx)
+{
+	unsigned int luma_size, chroma_size;
+	unsigned int i;
+	int ret;
+
+	ctx->mb_width = DIV_ROUND_UP(ctx->src_fmt.width, 16);
+	ctx->mb_height = DIV_ROUND_UP(ctx->src_fmt.height, 16);
+	ctx->mb_stride = ctx->src_fmt.bytesperline / 16;
+
+	ctx->crop_right = (ctx->mb_width * 16 - ctx->crop.width) / 2;
+	ctx->crop_bottom = (ctx->mb_height * 16 - ctx->crop.height) / 2;
+
+	ctx->frame_num = 0;
+	ctx->write_headers = true;
+	ctx->force_keyframe = false;
+	ctx->rc_qp = ctx->params.qp_p;		/* rate-control seed */
+	ctx->rc_buf = 0;
+
+	/*
+	 * Vendor recon geometry (register trace): the recon plane heights
+	 * are 128-aligned -- luma = ALIGN(mb_h*16, 128), chroma =
+	 * ALIGN(mb_h*8, 128) (240->256, 720->768, 1088->1152). A shorter
+	 * plane lets the VE motion-comp border write overrun the next
+	 * plane and drifts the P-frame chain.
+	 */
+	luma_size = VENC_ALIGN(ctx->mb_width * 16, 32) *
+		    VENC_ALIGN(ctx->mb_height * 16, 128);
+	chroma_size = VENC_ALIGN(ctx->mb_width * 16, 32) *
+		      VENC_ALIGN(ctx->mb_height * 8, 128);
+	ctx->rec_chroma_off = luma_size;
+
+	for (i = 0; i < 2; i++) {
+		ret = venc_buf_alloc(ctx, &ctx->rec_luma[i],
+				     luma_size + chroma_size);
+		if (ret)
+			goto err;
+
+		ret = venc_buf_alloc(ctx, &ctx->rec_sluma[i], luma_size / 4);
+		if (ret)
+			goto err;
+	}
+
+	ret = venc_buf_alloc(ctx, &ctx->mb_info, luma_size + chroma_size);
+	if (ret)
+		goto err;
+
+	/*
+	 * VE scratch-class buffers each get a full frame buffer. The vendor
+	 * register trace shows SCRATCH_BUF (0xb9c), UNK_BUF (0xb60) and
+	 * MB_INFO (0xbc0) as three distinct buffers; the exact VE size
+	 * requirement is unknown and an undersized buffer is a DMA overrun
+	 * (corrupt wide P-frames, or a kernel panic) — frame-sized is safe.
+	 */
+	ret = venc_buf_alloc(ctx, &ctx->enc_extra, luma_size + chroma_size);
+	if (ret)
+		goto err;
+
+	ret = venc_buf_alloc(ctx, &ctx->enc_scratch, luma_size + chroma_size);
+	if (ret)
+		goto err;
+
+	/*
+	 * Wide-frame line buffer (VE reg 0xbc4). For width > 2048 the VE AVC
+	 * engine cannot hold the per-row neighbour context in internal SRAM
+	 * and uses this external buffer instead; without it a wide encode
+	 * hangs (AVC_STATUS=0x80001660). Vendor libvenc_h264.so sizes it at
+	 * 8 bytes per luma column (disasm h264InitMemory, width >2047 path).
+	 */
+	ret = venc_buf_alloc(ctx, &ctx->line_buf, 8 * ctx->mb_width * 16);
+	if (ret)
+		goto err;
+
+	ctx->buffers_ready = true;
+	return 0;
+
+err:
+	sunxi_venc_h264_stop(ctx);
+	return ret;
+}
+
+/* ---- encode -------------------------------------------------------------- */
+
+/* Global VE setup the vendor encoder performs before an AVC encode. */
+static void venc_engine_setup(struct sunxi_venc_dev *dev)
+{
+	venc_write(dev, VE_CTRL, VE_CTRL_AVC_ENCODE);
+	venc_write(dev, VE_MODE, VE_MODE_AVC_ENCODE);
+
+	venc_write(dev, VE_ENC_INIT_01C, 0x00010000);
+	venc_write(dev, VE_ENC_INIT_030, 0x00000200);
+	venc_write(dev, VE_ENC_INIT_040, 0x0000000f);
+	venc_write(dev, VE_ENC_INIT_080, 0x00001c55);
+	venc_write(dev, VE_ENC_INIT_084, 0x000fffff);
+	venc_write(dev, VE_ENC_INIT_088, 0x00008000);
+}
+
+/*
+ * An IDR is emitted at every GOP boundary and whenever a keyframe was forced
+ * via V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME.
+ */
+bool sunxi_venc_h264_frame_is_idr(struct sunxi_venc_ctx *ctx)
+{
+	return ctx->force_keyframe ||
+	       (ctx->frame_num % ctx->params.gop_size) == 0;
+}
+
+/*
+ * Driver-side rate control. Pick the QP for the next frame: in fixed-QP mode
+ * (bitrate 0) use the configured I/P QP; otherwise use the feedback QP, with
+ * I frames biased lower for a cleaner GOP anchor.
+ */
+static unsigned int venc_rc_pick_qp(struct sunxi_venc_ctx *ctx, bool is_idr)
+{
+	struct sunxi_venc_params *p = &ctx->params;
+	unsigned int qp;
+
+	if (p->bitrate == 0)
+		qp = is_idr ? p->qp_i : p->qp_p;
+	else if (is_idr)
+		qp = ctx->rc_qp > 6 ? ctx->rc_qp - 6 : SUNXI_VENC_QP_LO;
+	else
+		qp = ctx->rc_qp;
+
+	return clamp(qp, p->qp_min, p->qp_max);
+}
+
+/*
+ * Feedback step: leaky-bucket rate control. rc_buf accumulates the signed bit
+ * error (coded - target) over every frame, IDR included; whenever it drifts a
+ * whole frame budget away, rc_qp moves one step and a budget is drained. This
+ * makes the loop pay back IDR overshoot over the following P-frames instead of
+ * ignoring it.
+ */
+static void venc_rc_update(struct sunxi_venc_ctx *ctx, bool is_idr,
+			   unsigned int coded_bytes)
+{
+	struct sunxi_venc_params *p = &ctx->params;
+	int target;
+
+	if (p->bitrate == 0)
+		return;
+
+	target = p->bitrate / max(p->framerate, 1u);	/* bits per frame */
+	if (target < 1)
+		target = 1;
+
+	ctx->rc_buf += (int)(coded_bytes * 8) - target;
+
+	while (ctx->rc_buf > target && ctx->rc_qp < p->qp_max) {
+		ctx->rc_qp++;
+		ctx->rc_buf -= target;
+	}
+	while (ctx->rc_buf < -target && ctx->rc_qp > p->qp_min) {
+		ctx->rc_qp--;
+		ctx->rc_buf += target;
+	}
+
+	/* Clamp the accumulator so a saturated QP cannot let it run away. */
+	ctx->rc_buf = clamp(ctx->rc_buf, -4 * target, 4 * target);
+}
+
+/*
+ * Encode one frame: src holds the raw NV12 input, dst receives the coded
+ * Annex-B bitstream. Frame type follows the GOP pattern. Returns the coded
+ * byte count, or a negative errno.
+ */
+int sunxi_venc_h264_encode(struct sunxi_venc_ctx *ctx,
+			   struct vb2_buffer *src, struct vb2_buffer *dst)
+{
+	struct sunxi_venc_dev *dev = ctx->dev;
+	bool is_idr = sunxi_venc_h264_frame_is_idr(ctx);
+	unsigned int cur, ref, h264_frame_num, qp;
+	struct sunxi_venc_buf *rec, *rec_s, *ref_pic, *ref_s;
+	dma_addr_t in_luma, in_chroma, out;
+	unsigned int luma_bytes, out_size, coded;
+	u32 mb_w = ctx->mb_width, mb_h = ctx->mb_height;
+	u32 status, len_bits;
+
+	if (!ctx->buffers_ready)
+		return -EINVAL;
+
+	/* Realign the GOP at every IDR (forced or periodic). */
+	if (is_idr) {
+		ctx->frame_num = 0;
+		ctx->force_keyframe = false;
+	}
+	cur = ctx->frame_num & 1;
+	ref = (ctx->frame_num + 1) & 1;		/* previous frame */
+	h264_frame_num = ctx->frame_num;
+	qp = venc_rc_pick_qp(ctx, is_idr);
+
+	rec = &ctx->rec_luma[cur];
+	rec_s = &ctx->rec_sluma[cur];
+	ref_pic = &ctx->rec_luma[ref];
+	ref_s = &ctx->rec_sluma[ref];
+
+	in_luma = vb2_dma_contig_plane_dma_addr(src, 0);
+	luma_bytes = ctx->src_fmt.bytesperline * ctx->src_fmt.height;
+	in_chroma = in_luma + luma_bytes;
+
+	out = vb2_dma_contig_plane_dma_addr(dst, 0);
+	out_size = ctx->dst_fmt.sizeimage;
+
+	venc_engine_setup(dev);
+
+	/* coded-bitstream output window (AVC block: iova >> 8) */
+	venc_write(dev, VE_AVC_VLE_OFFSET, 0);
+	venc_write(dev, VE_AVC_VLE_ADDR, out >> 8);
+	venc_write(dev, VE_AVC_VLE_END, (out + out_size - 1) >> 8);
+	venc_write(dev, VE_AVC_VLE_MAX, out_size * 8);
+
+	/* enable the HW bit-writer, clear stale status (w1c) */
+	venc_write(dev, VE_AVC_CTRL, VE_AVC_CTRL_BITWRITER_EN);
+	venc_write(dev, VE_AVC_STATUS, venc_read(dev, VE_AVC_STATUS));
+
+	/* SPS + PPS once per stream, then the per-frame slice header */
+	if (ctx->write_headers) {
+		venc_write_sps(ctx);
+		venc_write_pps(ctx);
+		ctx->write_headers = false;
+	}
+	venc_write_slice_header(ctx, is_idr, h264_frame_num, qp);
+
+	/* ISP input descriptor (ISP block: full iova) */
+	venc_write(dev, VE_ISP_INPUT_STRIDE, ctx->mb_stride << 16);
+	venc_write(dev, VE_ISP_INPUT_SIZE, (mb_w * 2 << 16) | (mb_h * 2));
+	venc_write(dev, VE_ISP_CTRL, 0);			/* NV12 */
+	venc_write(dev, VE_ISP_MB_WIDTH, mb_w);
+	venc_write(dev, VE_ISP_INPUT_SIZE2, (mb_h * 2 << 16) | (mb_w * 2));
+	venc_write(dev, VE_ISP_INPUT_LUMA, in_luma);
+	venc_write(dev, VE_ISP_INPUT_CHROMA, in_chroma);
+	venc_write(dev, VE_ISP_INPUT_CHROMA2, in_chroma + luma_bytes / 4);
+
+	/* reconstruction + scratch buffers (AVC block: iova >> 8) */
+	/*
+	 * VE_AVC_PIC_SIZE = real picture size in 8-px units (vendor trace:
+	 * 1920x1080 -> 0x00f00087, H = 1080/8 = 135), not the 16-aligned MB
+	 * grid. mb_h*2 over-states a non-MB-aligned height by one 8-px row
+	 * and drifts the recon across the P-frame chain.
+	 */
+	venc_write(dev, VE_AVC_PIC_SIZE,
+		   (VENC_ALIGN(ctx->crop.width, 8) / 8 << 16) |
+		   (VENC_ALIGN(ctx->crop.height, 8) / 8));
+	venc_write(dev, VE_AVC_REC_LUMA, rec->dma >> 8);
+	venc_write(dev, VE_AVC_REC_CHROMA, (rec->dma + ctx->rec_chroma_off) >> 8);
+	venc_write(dev, VE_AVC_REC_SLUMA, rec_s->dma >> 8);
+	venc_write(dev, VE_AVC_MB_INFO, ctx->mb_info.dma >> 8);
+	venc_write(dev, VE_AVC_LINE_BUF, ctx->line_buf.dma >> 8);
+	venc_write(dev, VE_AVC_UNK_BUF, ctx->enc_extra.dma >> 8);
+	venc_write(dev, VE_AVC_SCRATCH_BUF, ctx->enc_scratch.dma >> 8);
+
+	/* reference picture (previous frame's reconstruction) — P-frames only */
+	if (!is_idr) {
+		venc_write(dev, VE_AVC_REF_LUMA, ref_pic->dma >> 8);
+		venc_write(dev, VE_AVC_REF_CHROMA,
+			   (ref_pic->dma + ctx->rec_chroma_off) >> 8);
+		venc_write(dev, VE_AVC_REF_SLUMA, ref_s->dma >> 8);
+	}
+
+	/* QP / rate-control table image (VE_REG_TRACE.md snap 3/6) */
+	venc_write(dev, VE_AVC_RC_SETUP,
+		   is_idr ? VE_AVC_RC_SETUP_I : VE_AVC_RC_SETUP_P);
+	venc_write(dev, VE_AVC_QP_TBL0, 0x120f0c09);
+	venc_write(dev, VE_AVC_QP_TBL1, 0x261e1814);
+	venc_write(dev, VE_AVC_QP_TBL2, 0xffff3630);
+	venc_write(dev, VE_AVC_QP_TBL3, 0x00000228);
+	venc_write(dev, VE_AVC_RC_TBL0, 0x000c0002);
+	venc_write(dev, VE_AVC_RC_TBL1, 0x00400034);
+	venc_write(dev, VE_AVC_UNK_BE4, 0x2a104599);
+
+	/* encode parameters */
+	venc_write(dev, VE_AVC_PARAM,
+		   (is_idr ? VE_AVC_PARAM_ENCODE_I : VE_AVC_PARAM_ENCODE_P) |
+		   (ctx->params.cabac ? VE_AVC_PARAM_CABAC : 0));
+	venc_write(dev, VE_AVC_QP, SUNXI_VENC_QP_REG(qp));
+	venc_write(dev, VE_AVC_MOTION_EST, 0x00001200);
+
+	/*
+	 * (M1) IRQ-based completion replaces the 300 ms udelay poll. Arm the
+	 * completion + inflight flag BEFORE trigger so cedrus_irq cannot race
+	 * us and miss the signal.
+	 */
+	reinit_completion(&sunxi_venc_done);
+	atomic_set(&cedrus_enc_inflight, 1);
+
+	/* AVC_CTRL final value, then clear status and trigger the frame */
+	venc_write(dev, VE_AVC_CTRL,
+		   is_idr ? VE_AVC_CTRL_ENCODE_IDR : VE_AVC_CTRL_ENCODE_P);
+	venc_write(dev, VE_AVC_STATUS, venc_read(dev, VE_AVC_STATUS));
+	venc_write(dev, VE_AVC_TRIGGER, VE_AVC_TRIGGER_ENCODE);
+
+	if (!wait_for_completion_timeout(&sunxi_venc_done,
+					 msecs_to_jiffies(SUNXI_VENC_WAIT_TIMEOUT_MS))) {
+		/*
+		 * IRQ never fired. Clear the inflight flag we set so a delayed
+		 * IRQ doesn't dispatch back to a dead waiter, then force-ack
+		 * AVC_STATUS so the shared line drops if the engine eventually
+		 * does set the done bit.
+		 */
+		atomic_set(&cedrus_enc_inflight, 0);
+		venc_write(dev, VE_AVC_STATUS, ~0u);
+		dev_err(dev->dev, "encode timeout, AVC_STATUS=0x%08x\n",
+			venc_read(dev, VE_AVC_STATUS));
+		return -ETIMEDOUT;
+	}
+
+	/*
+	 * cedrus_irq captured the AVC status word for us (the kernel w1c-cleared
+	 * the live register before returning, so reading it again would yield 0).
+	 */
+	status = sunxi_venc_last_status;
+
+	if (!(status & VE_AVC_STATUS_DONE)) {
+		dev_err(dev->dev,
+			"encode spurious wake, AVC_STATUS=0x%08x\n", status);
+		return -EIO;
+	}
+
+	len_bits = venc_read(dev, VE_AVC_VLE_LENGTH);
+
+	if (!(status & VE_AVC_STATUS_SUCCESS)) {
+		dev_err(dev->dev, "encode error, AVC_STATUS=0x%08x\n", status);
+		return -EIO;
+	}
+
+	coded = DIV_ROUND_UP(len_bits, 8);
+	venc_rc_update(ctx, is_idr, coded);
+
+	return coded;
+}
